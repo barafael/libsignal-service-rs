@@ -171,7 +171,9 @@ impl SignalWebSocket<websocket::Identified> {
             server_public_params.receive_expiring_profile_key_credential(
                 &context,
                 &response,
-                zkgroup::Timestamp::from_epoch_seconds(now - now % 86400),
+                // The real time, as Signal's apps pass: the credential is refused if it
+                // expires more than a week after it.
+                zkgroup::Timestamp::from_epoch_seconds(now),
             )?,
         )
     }
