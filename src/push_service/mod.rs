@@ -188,6 +188,51 @@ impl PushService {
         Ok(ws)
     }
 
+    /// Creates a group on the server (`PUT /v1/groups/`).
+    pub(crate) async fn put_group(
+        &mut self,
+        credentials: HttpAuth,
+        group: crate::proto::Group,
+    ) -> Result<crate::proto::GroupResponse, ServiceError> {
+        use protobuf::ProtobufRequestBuilderExt;
+        self.request(
+            Method::PUT,
+            Endpoint::storage("/v1/groups/"),
+            HttpAuthOverride::Identified(credentials),
+        )?
+        .protobuf(group)
+        .map_err(|_| ServiceError::GroupsV2Error)?
+        .send()
+        .await?
+        .service_error_for_status()
+        .await?
+        .protobuf()
+        .await
+    }
+
+    /// Changes a group on the server (`PATCH /v1/groups/`); answers with the
+    /// change as signed by the server, to send on to the group's members.
+    pub(crate) async fn patch_group(
+        &mut self,
+        credentials: HttpAuth,
+        actions: crate::proto::group_change::Actions,
+    ) -> Result<crate::proto::GroupChangeResponse, ServiceError> {
+        use protobuf::ProtobufRequestBuilderExt;
+        self.request(
+            Method::PATCH,
+            Endpoint::storage("/v1/groups/"),
+            HttpAuthOverride::Identified(credentials),
+        )?
+        .protobuf(actions)
+        .map_err(|_| ServiceError::GroupsV2Error)?
+        .send()
+        .await?
+        .service_error_for_status()
+        .await?
+        .protobuf()
+        .await
+    }
+
     pub(crate) async fn get_group(
         &mut self,
         credentials: HttpAuth,
