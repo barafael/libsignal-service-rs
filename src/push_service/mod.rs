@@ -87,7 +87,7 @@ impl PushService {
         credentials: Option<ServiceCredentials>,
         user_agent: impl AsRef<str>,
     ) -> Self {
-        let cfg: ServiceConfiguration = env.into();
+        let cfg = ServiceConfiguration::from(&env);
 
         // Use the ring provider except if the application already installed one.
         if rustls::crypto::CryptoProvider::get_default().is_none() {
@@ -175,7 +175,7 @@ impl PushService {
             .await?;
 
         let unidentified_push_service = PushService {
-            servers: self.servers,
+            servers: self.servers.clone(),
             cfg: self.cfg.clone(),
             credentials: None,
             client: self.client.clone(),
@@ -361,8 +361,11 @@ mod tests {
         let environments = &[SignalServers::Staging, SignalServers::Production];
 
         for env in environments {
-            let _ =
-                super::PushService::new(*env, None, "libsignal-service test");
+            let _ = super::PushService::new(
+                env.clone(),
+                None,
+                "libsignal-service test",
+            );
         }
     }
 
