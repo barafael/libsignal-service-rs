@@ -410,8 +410,8 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         )
     }
 
-    pub fn servers(&self) -> SignalServers {
-        self.unidentified_push_service.servers
+    pub fn servers(&self) -> &SignalServers {
+        &self.unidentified_push_service.servers
     }
 
     pub fn is_closed(&self) -> bool {
