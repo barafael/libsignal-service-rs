@@ -137,6 +137,9 @@ pub enum ServiceError {
     #[error("Not found.")]
     NotFoundError,
 
+    #[error("contact discovery is only available on Signal's servers")]
+    ContactDiscoveryUnavailable,
+
     #[error("failed to decrypt field from device info: {0}")]
     DecryptDeviceInfoFieldError(&'static str),
 
