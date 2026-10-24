@@ -193,6 +193,7 @@ impl PushService {
         Ok(ws)
     }
 
+    /// v2: under v1 the server answers with an empty body.
     pub(crate) async fn put_group(
         &mut self,
         credentials: HttpAuth,
@@ -201,7 +202,7 @@ impl PushService {
         use protobuf::ProtobufRequestBuilderExt;
         self.request(
             Method::PUT,
-            Endpoint::storage("/v1/groups/"),
+            Endpoint::storage("/v2/groups/"),
             HttpAuthOverride::Identified(credentials),
         )?
         .protobuf(group)
@@ -214,7 +215,8 @@ impl PushService {
         .await
     }
 
-    /// The invite link's password lets a non-member in, or ask in.
+    /// The invite link's password lets a non-member in, or ask in. v2: under
+    /// v1 the server answers with the bare `GroupChange`.
     pub(crate) async fn patch_group(
         &mut self,
         credentials: HttpAuth,
@@ -224,10 +226,10 @@ impl PushService {
         use protobuf::ProtobufRequestBuilderExt;
         let path = match invite_link_password {
             Some(password) => format!(
-                "/v1/groups/?inviteLinkPassword={}",
+                "/v2/groups/?inviteLinkPassword={}",
                 BASE64_URL_SAFE_NO_PAD.encode(password)
             ),
-            None => "/v1/groups/".into(),
+            None => "/v2/groups/".into(),
         };
         self.request(
             Method::PATCH,
