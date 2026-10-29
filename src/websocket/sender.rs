@@ -13,8 +13,12 @@ use libsignal_net_grpc::proto::chat::messages::{
 };
 
 use crate::{
-    proto::envelope,
-    push_service::{self, ProofRequired},
+    proto::{envelope, WebSocketRequestMessage},
+    push_service::{
+        self,
+        response::{error_mapper, json_or_unhandled, SignalServiceResponse},
+        ProofRequired,
+    },
     sender::{OutgoingPushMessage, OutgoingPushMessages, SendMessageResponse},
     unidentified_access::UnidentifiedAccess,
     utils::BASE64_RELAXED,
@@ -22,6 +26,18 @@ use crate::{
 
 use super::*;
 use base64::Engine;
+
+// Signal-Server: controllers/MessageController.java
+// (PUT /v1/messages/multi_recipient)
+error_mapper! {
+    put_multi_recipient_messages_errors:
+        // 409: mismatched devices
+        CONFLICT => fn multi_recipient_mismatched_devices,
+        // 410: stale devices
+        GONE => fn multi_recipient_stale_devices,
+        // 428: proof required
+        PRECONDITION_REQUIRED => ProofRequiredError(crate::push_service::ProofRequired),
+}
 
 impl<C: WebSocketType> SignalWebSocket<C> {
     pub async fn send_messages(
@@ -241,5 +257,132 @@ impl OutgoingPushMessages {
                 messages,
             },
         ))
+    }
+}
+
+impl<C: WebSocketType> SignalWebSocket<C> {
+    /// One message sealed for many devices
+    /// (`sealed_sender_multi_recipient_encrypt`): `PUT
+    /// /v1/messages/multi_recipient`. `access_key` is the recipients' access
+    /// keys combined (XOR); a story goes without one.
+    pub async fn send_multi_recipient(
+        &mut self,
+        body: Vec<u8>,
+        access_key: Option<[u8; 16]>,
+        timestamp: u64,
+        online: bool,
+        urgent: bool,
+        story: bool,
+    ) -> Result<MultiRecipientResponse, ServiceError> {
+        let mut request = WebSocketRequestMessage::new(Method::PUT)
+            .path(format!(
+                "/v1/messages/multi_recipient?ts={timestamp}&online={online}&urgent={urgent}&story={story}"
+            ))
+            .header("content-type", "application/vnd.signal-messenger.mrm");
+        if let Some(key) = access_key {
+            request = request
+                .header("Unidentified-Access-Key", BASE64_RELAXED.encode(key));
+        }
+        let mut request = request.build();
+        request.body = Some(body);
+        self.request(request)
+            .await?
+            .service_error_for_status_with(put_multi_recipient_messages_errors)
+            .await?
+            .json()
+            .await
+    }
+}
+
+/// What the server answers a multi-recipient send: the recipients it doesn't
+/// know.
+#[derive(Debug, serde::Deserialize)]
+pub struct MultiRecipientResponse {
+    #[serde(default)]
+    pub uuids404: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountDevicesBody {
+    uuid: String,
+    devices: DevicesBody,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DevicesBody {
+    #[serde(default)]
+    missing_devices: Vec<u32>,
+    #[serde(default)]
+    extra_devices: Vec<u32>,
+    #[serde(default)]
+    stale_devices: Vec<u32>,
+}
+
+fn device_ids(ids: Vec<u32>) -> Result<Vec<DeviceId>, ServiceError> {
+    ids.into_iter()
+        .map(|id| {
+            DeviceId::try_from(id).map_err(|_| ServiceError::InvalidFrame {
+                reason: "device id out of range",
+            })
+        })
+        .collect()
+}
+
+fn account_service_id(uuid: &str) -> Result<ServiceId, ServiceError> {
+    ServiceId::parse_from_service_id_string(uuid).ok_or(
+        ServiceError::InvalidFrame {
+            reason: "invalid service id in a multi-recipient response",
+        },
+    )
+}
+
+async fn multi_recipient_mismatched_devices<R>(response: R) -> ServiceError
+where
+    R: SignalServiceResponse,
+    ServiceError: From<<R as SignalServiceResponse>::Error>,
+{
+    let accounts =
+        match json_or_unhandled::<R, Vec<AccountDevicesBody>>(response).await {
+            Ok(accounts) => accounts,
+            Err(error) => return error,
+        };
+    let accounts = accounts.into_iter().map(|account| {
+        Ok(push_service::AccountMismatchedDevices {
+            uuid: account_service_id(&account.uuid)?,
+            devices: push_service::MismatchedDevices {
+                missing_devices: device_ids(account.devices.missing_devices)?,
+                extra_devices: device_ids(account.devices.extra_devices)?,
+            },
+        })
+    });
+    match accounts.collect() {
+        Ok(accounts) => ServiceError::MultiRecipientMismatchedDevices(accounts),
+        Err(error) => error,
+    }
+}
+
+async fn multi_recipient_stale_devices<R>(response: R) -> ServiceError
+where
+    R: SignalServiceResponse,
+    ServiceError: From<<R as SignalServiceResponse>::Error>,
+{
+    let accounts =
+        match json_or_unhandled::<R, Vec<AccountDevicesBody>>(response).await {
+            Ok(accounts) => accounts,
+            Err(error) => return error,
+        };
+    let accounts = accounts.into_iter().map(|account| {
+        Ok(push_service::AccountStaleDevices {
+            uuid: account_service_id(&account.uuid)?,
+            devices: push_service::StaleDevices {
+                stale_devices: device_ids(account.devices.stale_devices)?,
+            },
+        })
+    });
+    match accounts.collect() {
+        Ok(accounts) => ServiceError::MultiRecipientStaleDevices(accounts),
+        Err(error) => error,
     }
 }
