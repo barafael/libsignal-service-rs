@@ -3,9 +3,12 @@ use std::{collections::HashSet, time::SystemTime};
 use chrono::prelude::*;
 use libsignal_core::{curve::CurveError, InvalidDeviceId};
 use libsignal_protocol::{
-    process_prekey_bundle, Aci, DeviceId, IdentityKey, IdentityKeyPair, Pni,
-    ProtocolStore, SenderCertificate, SenderKeyStore, ServiceId,
-    SessionNotFound, SignalProtocolError,
+    create_sender_key_distribution_message, group_encrypt,
+    process_prekey_bundle, sealed_sender_multi_recipient_encrypt, Aci,
+    CiphertextMessageType, ContentHint, DeviceId, IdentityKey, IdentityKeyPair,
+    Pni, ProtocolAddress, ProtocolStore, SenderCertificate,
+    SenderKeyDistributionMessage, SenderKeyStore, ServiceId, SessionNotFound,
+    SessionRecord, SignalProtocolError, UnidentifiedSenderMessageContent,
 };
 use rand::{rng, CryptoRng, Rng};
 use tracing::{debug, error, info, trace, warn};
@@ -164,6 +167,9 @@ pub enum MessageSenderError {
 
     #[error("a story to {service_id:?} needs sealed sender: the server stores stories without their sender")]
     StoryWithoutSealedSender { service_id: ServiceId },
+
+    #[error("a recipient's devices changed: distribute the sender key to the new ones and send again")]
+    SenderKeyDevicesChanged,
 }
 
 pub type GroupV2Id = [u8; GROUP_IDENTIFIER_LEN];
@@ -515,13 +521,35 @@ where
         }
 
         // we only need to send a synchronization message once
-        if needs_sync_in_results || self.is_multi_device().await {
+        self.sync_group_send(
+            &content_body,
+            timestamp,
+            &results,
+            needs_sync_in_results,
+        )
+        .await;
+
+        results
+    }
+
+    /// Tells our other devices of a group send, once, with the results of its
+    /// sends ([`Self::send_message_to_group`]'s, or a caller's own, as with
+    /// [`Self::send_with_sender_key`]). `needs_sync`: a result said the server
+    /// wants one.
+    pub async fn sync_group_send(
+        &mut self,
+        content_body: &ContentBody,
+        timestamp: u64,
+        results: &[SendMessageResult],
+        needs_sync: bool,
+    ) {
+        if needs_sync || self.is_multi_device().await {
             if let Some(sync_message) = self
                 .create_multi_device_sent_transcript_content(
                     None,
                     content_body.clone(),
                     timestamp,
-                    &results,
+                    results,
                 )
             {
                 // Note: the result of sending a sync message is not included in results
@@ -547,8 +575,6 @@ where
                 error!("could not create sync message from a group message")
             }
         }
-
-        results
     }
 
     /// Send a sender-key retry receipt
@@ -616,8 +642,33 @@ where
     async fn try_send_message(
         &mut self,
         recipient: ServiceId,
-        mut unidentified_access: Option<&UnidentifiedAccess>,
+        unidentified_access: Option<&UnidentifiedAccess>,
         content_body: &ContentBody,
+        timestamp: u64,
+        include_pni_signature: bool,
+        online: bool,
+    ) -> SendMessageResult {
+        let story = matches!(content_body, ContentBody::StoryMessage(_));
+        self.try_send_content(
+            recipient,
+            unidentified_access,
+            content_body.clone().into_proto(),
+            story,
+            timestamp,
+            include_pni_signature,
+            online,
+        )
+        .await
+    }
+
+    /// [`Self::try_send_message`], for a content as it goes out.
+    #[expect(clippy::too_many_arguments)]
+    async fn try_send_content(
+        &mut self,
+        recipient: ServiceId,
+        mut unidentified_access: Option<&UnidentifiedAccess>,
+        mut content: crate::proto::Content,
+        story: bool,
         timestamp: u64,
         include_pni_signature: bool,
         online: bool,
@@ -626,7 +677,6 @@ where
 
         use prost::Message;
 
-        let mut content = content_body.clone().into_proto();
         if include_pni_signature {
             content.pni_signature_message = Some(self.create_pni_signature()?);
         }
@@ -636,15 +686,11 @@ where
         // The server stores a story without its sender (Signal-Server
         // MessageController.java, `sendStoryMessage`): sent identified, it
         // couldn't be decrypted.
-        let story = matches!(content_body, ContentBody::StoryMessage(_));
         if story && unidentified_access.is_none() {
             return Err(MessageSenderError::StoryWithoutSealedSender {
                 service_id: recipient,
             });
         }
-
-        let mut rng = rng();
-        let session_lock = self.cipher.session_lock().clone();
 
         for _ in 0..4u8 {
             let Some(EncryptedMessages {
@@ -702,69 +748,11 @@ where
                 },
                 Err(ServiceError::MismatchedDevicesException(ref m)) => {
                     tracing::debug!("{:?}", m);
-                    for extra_device_id in &m.extra_devices {
-                        tracing::debug!(
-                            "dropping session with device {}",
-                            extra_device_id
-                        );
-                        let _step = session_lock.step().await;
-                        self.protocol_store
-                            .delete_service_addr_device_session(
-                                &recipient
-                                    .to_protocol_address(*extra_device_id)?,
-                            )
-                            .await?;
-                    }
-
-                    for missing_device_id in &m.missing_devices {
-                        tracing::debug!(
-                            "creating session with missing device {}",
-                            missing_device_id
-                        );
-                        let remote_address = recipient
-                            .to_protocol_address(*missing_device_id)?;
-                        let pre_key = self
-                            .identified_ws
-                            .get_pre_key(&recipient, *missing_device_id)
-                            .await?;
-
-                        let _step = session_lock.step().await;
-                        process_prekey_bundle(
-                            &remote_address,
-                            &self
-                                .local_aci
-                                .to_protocol_address(self.device_id)
-                                .expect("valid device id"),
-                            &mut self.protocol_store.clone(),
-                            &mut self.protocol_store,
-                            &pre_key,
-                            SystemTime::now(),
-                            &mut rng,
-                        )
-                        .await
-                        .map_err(|e| {
-                            error!("failed to create session: {}", e);
-                            MessageSenderError::UntrustedIdentity {
-                                address: recipient,
-                            }
-                        })?;
-                    }
+                    self.mend_mismatched_devices(recipient, m).await?;
                 },
                 Err(ServiceError::StaleDevices(ref m)) => {
                     tracing::debug!("{:?}", m);
-                    for extra_device_id in &m.stale_devices {
-                        tracing::debug!(
-                            "dropping session with device {}",
-                            extra_device_id
-                        );
-                        let _step = session_lock.step().await;
-                        self.protocol_store
-                            .delete_service_addr_device_session(
-                                &recipient
-                                    .to_protocol_address(*extra_device_id)?,
-                            )
-                            .await?;
-                    }
+                    self.drop_stale_sessions(recipient, m).await?;
                 },
                 Err(ServiceError::ProofRequiredError(ref p)) => {
                     tracing::debug!("{:?}", p);
@@ -790,6 +778,324 @@ where
         }
 
         Err(MessageSenderError::MaximumRetriesLimitExceeded)
+    }
+
+    /// Our sender key's distribution message for `distribution_id`, the key
+    /// made first if there is none: what a device needs to decrypt what we
+    /// send with that key.
+    pub async fn sender_key_distribution_message(
+        &mut self,
+        distribution_id: Uuid,
+    ) -> Result<SenderKeyDistributionMessage, MessageSenderError> {
+        let own = self.local_aci.to_protocol_address(self.device_id)?;
+        let session_lock = self.cipher.session_lock().clone();
+        let _step = session_lock.step().await;
+        Ok(create_sender_key_distribution_message(
+            &own,
+            distribution_id,
+            &mut self.protocol_store,
+            &mut rng(),
+        )
+        .await?)
+    }
+
+    /// Sends `distribution` alone to every device of `recipient`'s, as
+    /// Signal's apps do before a device's first message with our sender key.
+    pub async fn send_sender_key_distribution(
+        &mut self,
+        recipient: ServiceId,
+        unidentified_access: Option<&UnidentifiedAccess>,
+        distribution: &SenderKeyDistributionMessage,
+        timestamp: u64,
+    ) -> SendMessageResult {
+        let content = crate::proto::Content {
+            sender_key_distribution_message: Some(
+                distribution.serialized().to_vec(),
+            ),
+            ..Default::default()
+        };
+        self.try_send_content(
+            recipient,
+            unidentified_access,
+            content,
+            false,
+            timestamp,
+            false,
+            false,
+        )
+        .await
+    }
+
+    /// The devices of `recipient`'s that a sender-key message goes to, with
+    /// their registration ids: those we have sessions with, a session made
+    /// with its primary first if there is none.
+    pub async fn sender_key_devices(
+        &mut self,
+        recipient: ServiceId,
+    ) -> Result<Vec<(DeviceId, u32)>, MessageSenderError> {
+        let primary = recipient.to_protocol_address(*DEFAULT_DEVICE_ID)?;
+        if self.protocol_store.load_session(&primary).await?.is_none() {
+            let missing = MismatchedDevices {
+                missing_devices: vec![*DEFAULT_DEVICE_ID],
+                extra_devices: Vec::new(),
+            };
+            self.mend_mismatched_devices(recipient, &missing).await?;
+        }
+        let mut devices: Vec<DeviceId> = self
+            .protocol_store
+            .get_sub_device_sessions(&recipient)
+            .await?;
+        devices.push(*DEFAULT_DEVICE_ID);
+        devices.sort();
+        devices.dedup();
+        let mut found = Vec::new();
+        for device in devices {
+            let address = recipient.to_protocol_address(device)?;
+            if let Some(session) =
+                self.protocol_store.load_session(&address).await?
+            {
+                found.push((device, session.remote_registration_id()?));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Sends `content_body` to `recipients` with our sender key for
+    /// `distribution_id`, as Signal's apps send to a group: encrypted once,
+    /// sealed for each of their devices ([`Self::sender_key_devices`]), in
+    /// one request (`PUT /v1/messages/multi_recipient`), authorized by their
+    /// access keys combined. Each device must have our sender key already
+    /// ([`Self::send_sender_key_distribution`]).
+    ///
+    /// When the server says a recipient's devices changed (409, 410), the
+    /// sessions are mended and [`MessageSenderError::SenderKeyDevicesChanged`]
+    /// says so: the caller distributes the key to the new devices and sends
+    /// again. A recipient the server doesn't know comes back as
+    /// [`MessageSenderError::NotFound`], the others as sent.
+    #[expect(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        skip(self, recipients, content_body),
+        fields(recipients = recipients.len()),
+    )]
+    pub async fn send_with_sender_key(
+        &mut self,
+        distribution_id: Uuid,
+        group_id: &[u8],
+        recipients: &[(ServiceId, UnidentifiedAccess)],
+        content_body: &ContentBody,
+        timestamp: u64,
+        online: bool,
+        urgent: bool,
+    ) -> Result<Vec<SendMessageResult>, MessageSenderError> {
+        use prost::Message;
+
+        let Some((_, first)) = recipients.first() else {
+            return Ok(Vec::new());
+        };
+        let certificate = first.certificate.clone();
+        let story = matches!(content_body, ContentBody::StoryMessage(_));
+        let content = content_body.clone().into_proto().encode_to_vec();
+        let padded = crate::cipher::add_padding(3, &content)?;
+
+        let own = self.local_aci.to_protocol_address(self.device_id)?;
+        let mut addresses = Vec::new();
+        let mut sessions = Vec::new();
+        for (recipient, _) in recipients {
+            for (device, _) in self.sender_key_devices(*recipient).await? {
+                let address = recipient.to_protocol_address(device);
+                let session = self
+                    .protocol_store
+                    .load_session(&address)
+                    .await?
+                    .ok_or_else(|| {
+                        SignalProtocolError::SessionNotFound(
+                            SessionNotFound::new(
+                                address.clone(),
+                                "send_with_sender_key",
+                            ),
+                        )
+                    })?;
+                addresses.push(address);
+                sessions.push(session);
+            }
+        }
+
+        let session_lock = self.cipher.session_lock().clone();
+        let step = session_lock.step().await;
+        let message = group_encrypt(
+            &mut self.protocol_store,
+            &own,
+            distribution_id,
+            &padded,
+            &mut rng(),
+        )
+        .await?;
+        drop(step);
+        let usmc = UnidentifiedSenderMessageContent::new(
+            CiphertextMessageType::SenderKey,
+            certificate,
+            message.serialized().to_vec(),
+            ContentHint::Resendable,
+            Some(group_id.to_vec()),
+        )?;
+        let address_refs: Vec<&ProtocolAddress> = addresses.iter().collect();
+        let session_refs: Vec<&SessionRecord> = sessions.iter().collect();
+        let body = sealed_sender_multi_recipient_encrypt(
+            &address_refs,
+            &session_refs,
+            std::iter::empty(),
+            &usmc,
+            &self.protocol_store,
+            &mut rng(),
+        )
+        .await?;
+
+        // A story goes without: the server checks no access key for one.
+        let access_key = (!story).then(|| {
+            recipients
+                .iter()
+                .fold([0u8; 16], |mut combined, (_, access)| {
+                    for (byte, key) in combined.iter_mut().zip(&access.key) {
+                        *byte ^= key;
+                    }
+                    combined
+                })
+        });
+        let sent = self
+            .unidentified_ws
+            .send_multi_recipient(
+                body, access_key, timestamp, online, urgent, story,
+            )
+            .await;
+        match sent {
+            Ok(response) => {
+                let unknown: Vec<ServiceId> = response
+                    .uuids404
+                    .iter()
+                    .filter_map(|id| {
+                        ServiceId::parse_from_service_id_string(id)
+                    })
+                    .collect();
+                let mut results = Vec::new();
+                for (recipient, _) in recipients {
+                    if unknown.contains(recipient) {
+                        results.push(Err(MessageSenderError::NotFound {
+                            service_id: *recipient,
+                        }));
+                        continue;
+                    }
+                    let used_identity_key = self
+                        .protocol_store
+                        .get_identity(
+                            &recipient.to_protocol_address(*DEFAULT_DEVICE_ID),
+                        )
+                        .await?
+                        .ok_or(MessageSenderError::UntrustedIdentity {
+                            address: *recipient,
+                        })?;
+                    results.push(Ok(SentMessage {
+                        recipient: *recipient,
+                        used_identity_key,
+                        unidentified: true,
+                        needs_sync: false,
+                    }));
+                }
+                Ok(results)
+            },
+            Err(ServiceError::MultiRecipientMismatchedDevices(accounts)) => {
+                for account in &accounts {
+                    debug!(?account, "a recipient's devices changed");
+                    self.mend_mismatched_devices(
+                        account.uuid,
+                        &account.devices,
+                    )
+                    .await?;
+                }
+                Err(MessageSenderError::SenderKeyDevicesChanged)
+            },
+            Err(ServiceError::MultiRecipientStaleDevices(accounts)) => {
+                for account in &accounts {
+                    debug!(?account, "a recipient's devices were set up again");
+                    self.drop_stale_sessions(account.uuid, &account.devices)
+                        .await?;
+                }
+                Err(MessageSenderError::SenderKeyDevicesChanged)
+            },
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// What the server's 409 said of `recipient`'s devices, mended: sessions
+    /// with devices it no longer has dropped, sessions made with its new ones.
+    async fn mend_mismatched_devices(
+        &mut self,
+        recipient: ServiceId,
+        m: &MismatchedDevices,
+    ) -> Result<(), MessageSenderError> {
+        let session_lock = self.cipher.session_lock().clone();
+        let mut rng = rng();
+        for extra_device_id in &m.extra_devices {
+            tracing::debug!("dropping session with device {}", extra_device_id);
+            let _step = session_lock.step().await;
+            self.protocol_store
+                .delete_service_addr_device_session(
+                    &recipient.to_protocol_address(*extra_device_id)?,
+                )
+                .await?;
+        }
+
+        for missing_device_id in &m.missing_devices {
+            tracing::debug!(
+                "creating session with missing device {}",
+                missing_device_id
+            );
+            let remote_address =
+                recipient.to_protocol_address(*missing_device_id)?;
+            let pre_key = self
+                .identified_ws
+                .get_pre_key(&recipient, *missing_device_id)
+                .await?;
+
+            let _step = session_lock.step().await;
+            process_prekey_bundle(
+                &remote_address,
+                &self
+                    .local_aci
+                    .to_protocol_address(self.device_id)
+                    .expect("valid device id"),
+                &mut self.protocol_store.clone(),
+                &mut self.protocol_store,
+                &pre_key,
+                SystemTime::now(),
+                &mut rng,
+            )
+            .await
+            .map_err(|e| {
+                error!("failed to create session: {}", e);
+                MessageSenderError::UntrustedIdentity { address: recipient }
+            })?;
+        }
+        Ok(())
+    }
+
+    /// What the server's 410 said of `recipient`'s devices, mended: sessions
+    /// with devices set up again since dropped.
+    async fn drop_stale_sessions(
+        &mut self,
+        recipient: ServiceId,
+        m: &StaleDevices,
+    ) -> Result<(), MessageSenderError> {
+        let session_lock = self.cipher.session_lock().clone();
+        for extra_device_id in &m.stale_devices {
+            tracing::debug!("dropping session with device {}", extra_device_id);
+            let _step = session_lock.step().await;
+            self.protocol_store
+                .delete_service_addr_device_session(
+                    &recipient.to_protocol_address(*extra_device_id)?,
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     /// Upload contact details to the CDN and send a sync message
