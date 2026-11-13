@@ -55,6 +55,9 @@ pub struct OutgoingPushMessages {
     pub timestamp: u64,
     pub messages: Vec<OutgoingPushMessage>,
     pub online: bool,
+    /// Whether offline devices are woken for it ([`ContentBody::urgent`]); the server takes a
+    /// missing one as `true`.
+    pub urgent: bool,
     /// A story: the server takes this from the query, not the body
     /// (`?story=true`, Signal-Server MessageController.java), and stores
     /// the envelope as a story, without its sender.
@@ -657,6 +660,7 @@ where
             timestamp,
             include_pni_signature,
             online,
+            content_body.urgent(),
         )
         .await
     }
@@ -672,6 +676,7 @@ where
         timestamp: u64,
         include_pni_signature: bool,
         online: bool,
+        urgent: bool,
     ) -> SendMessageResult {
         trace!("trying to send a message");
 
@@ -715,6 +720,7 @@ where
                 timestamp,
                 messages,
                 online,
+                urgent,
                 story,
             };
 
@@ -801,12 +807,15 @@ where
 
     /// Sends `distribution` alone to every device of `recipient`'s, as
     /// Signal's apps do before a device's first message with our sender key.
+    /// It is as `urgent` as the message it goes ahead of (Signal-Desktop
+    /// `sendToGroupViaSenderKey`).
     pub async fn send_sender_key_distribution(
         &mut self,
         recipient: ServiceId,
         unidentified_access: Option<&UnidentifiedAccess>,
         distribution: &SenderKeyDistributionMessage,
         timestamp: u64,
+        urgent: bool,
     ) -> SendMessageResult {
         let content = crate::proto::Content {
             sender_key_distribution_message: Some(
@@ -822,6 +831,7 @@ where
             timestamp,
             false,
             false,
+            urgent,
         )
         .await
     }
@@ -1544,8 +1554,70 @@ mod tests {
             timestamp: 1,
             messages: Vec::new(),
             online: false,
+            urgent: !story,
             story,
         }
+    }
+
+    #[test]
+    fn urgent_goes_in_the_body() {
+        let body = serde_json::to_string(&messages(true)).unwrap();
+        assert!(body.contains(r#""urgent":false"#), "{body}");
+    }
+
+    #[test]
+    fn only_what_a_person_should_see_now_is_urgent() {
+        use crate::content::ContentBody;
+        use crate::proto::{
+            data_message::Flags, sync_message, DataMessage, ReceiptMessage,
+            SyncMessage, TypingMessage,
+        };
+
+        let text = DataMessage {
+            body: Some("hello".into()),
+            ..Default::default()
+        };
+        let timer = DataMessage {
+            flags: Some(Flags::ExpirationTimerUpdate as u32),
+            ..Default::default()
+        };
+        let read = SyncMessage {
+            read: vec![sync_message::Read::default()],
+            ..Default::default()
+        };
+        let keys = SyncMessage {
+            content: Some(sync_message::Content::Request(
+                sync_message::Request {
+                    r#type: Some(sync_message::request::Type::Keys as i32),
+                },
+            )),
+            ..Default::default()
+        };
+        let blocked = SyncMessage {
+            content: Some(sync_message::Content::Request(
+                sync_message::Request {
+                    r#type: Some(sync_message::request::Type::Blocked as i32),
+                },
+            )),
+            ..Default::default()
+        };
+        let sent = SyncMessage {
+            content: Some(sync_message::Content::Sent(
+                sync_message::Sent::default(),
+            )),
+            ..Default::default()
+        };
+
+        assert!(ContentBody::DataMessage(text).urgent());
+        assert!(!ContentBody::DataMessage(timer).urgent());
+        assert!(
+            !ContentBody::ReceiptMessage(ReceiptMessage::default()).urgent()
+        );
+        assert!(!ContentBody::TypingMessage(TypingMessage::default()).urgent());
+        assert!(ContentBody::SynchronizeMessage(read).urgent());
+        assert!(ContentBody::SynchronizeMessage(keys).urgent());
+        assert!(!ContentBody::SynchronizeMessage(blocked).urgent());
+        assert!(!ContentBody::SynchronizeMessage(sent).urgent());
     }
 
     #[test]
