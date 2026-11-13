@@ -482,12 +482,15 @@ where
                 }
             },
             Type::UnidentifiedSender => {
-                let SealedSenderDecryptionResult {
-                    sender_uuid,
-                    sender_e164: _,
-                    device_id,
-                    mut message,
-                } = sealed_sender_decrypt(
+                let (
+                    SealedSenderDecryptionResult {
+                        sender_uuid,
+                        sender_e164: _,
+                        device_id,
+                        mut message,
+                    },
+                    was_plaintext,
+                ) = sealed_sender_decrypt(
                     ciphertext,
                     &self.trust_roots,
                     Timestamp::from_epoch_millis(envelope.client_timestamp()),
@@ -535,7 +538,7 @@ where
                     data: message,
                     sender,
                     sender_device: device_id,
-                    was_plaintext: false,
+                    was_plaintext,
                     unidentified_sender: true,
                     needs_receipt,
                 }
@@ -799,7 +802,7 @@ async fn sealed_sender_decrypt(
     signed_pre_key_store: &mut dyn SignedPreKeyStore,
     sender_key_store: &mut dyn SenderKeyStore,
     kyber_pre_key_store: &mut dyn KyberPreKeyStore,
-) -> Result<SealedSenderDecryptionResult, SealedSenderDecryptionError> {
+) -> Result<(SealedSenderDecryptionResult, bool), SealedSenderDecryptionError> {
     let usmc =
         sealed_sender_decrypt_to_usmc(ciphertext, identity_store).await?;
 
@@ -840,6 +843,10 @@ async fn sealed_sender_decrypt(
         usmc.sender()?.sender_device_id()?,
     );
 
+    // A sealed `PlaintextContent` is outside any session: like an unsealed one, it may only
+    // carry a decryption error message.
+    let was_plaintext = usmc.msg_type()? == CiphertextMessageType::Plaintext;
+
     sealed_sender_decrypt_with_validated_usmc(
         &usmc,
         &remote_address,
@@ -852,6 +859,7 @@ async fn sealed_sender_decrypt(
         kyber_pre_key_store,
     )
     .await
+    .map(|result| (result, was_plaintext))
     .map_err(|inner| SealedSenderDecryptionError {
         inner,
         sender: Some(remote_address),
@@ -919,4 +927,110 @@ async fn sealed_sender_decrypt_with_validated_usmc(
         device_id: usmc.sender()?.sender_device_id()?,
         message,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use libsignal_protocol::{
+        sealed_sender_encrypt_from_usmc, CiphertextMessageType, ContentHint,
+        DeviceId, IdentityKeyPair, IdentityKeyStore, InMemSignalProtocolStore,
+        KeyPair, PlaintextContent, ProtocolAddress, SenderCertificate,
+        ServerCertificate, Timestamp, UnidentifiedSenderMessageContent,
+    };
+    use prost::Message;
+    use rand::rng;
+
+    use super::sealed_sender_decrypt;
+
+    const SENDER: &str = "9d0652a3-dcc3-4d11-975f-74d61598733f";
+    const RECIPIENT: &str = "1c3e0d3a-7a5f-4f6b-9a0e-2b8f0c7d6e5a";
+
+    /// A sealed `PlaintextContent` carrying a data message is flagged as
+    /// plaintext, so that `open_envelope` drops it as it drops an unsealed one.
+    #[tokio::test]
+    async fn sealed_plaintext_is_flagged_plaintext() {
+        let mut rng = rng();
+        let device = DeviceId::new(1).unwrap();
+        let sender_identity = IdentityKeyPair::generate(&mut rng);
+        let recipient_identity = IdentityKeyPair::generate(&mut rng);
+        let sender_store =
+            InMemSignalProtocolStore::new(sender_identity, 1).unwrap();
+        let mut recipient_store =
+            InMemSignalProtocolStore::new(recipient_identity, 2).unwrap();
+        let recipient = ProtocolAddress::new(RECIPIENT.into(), device);
+        let mut sender_store = sender_store;
+        sender_store
+            .save_identity(&recipient, recipient_identity.identity_key())
+            .await
+            .unwrap();
+
+        let trust_root = KeyPair::generate(&mut rng);
+        let server_key = KeyPair::generate(&mut rng);
+        let server = ServerCertificate::new(
+            1,
+            server_key.public_key,
+            &trust_root.private_key,
+            &mut rng,
+        )
+        .unwrap();
+        let certificate = SenderCertificate::new(
+            SENDER.into(),
+            None,
+            *sender_identity.public_key(),
+            device,
+            Timestamp::from_epoch_millis(u64::MAX / 2),
+            server,
+            &server_key.private_key,
+            &mut rng,
+        )
+        .unwrap();
+
+        let content = crate::proto::Content {
+            content: Some(crate::proto::content::Content::DataMessage(
+                crate::proto::DataMessage {
+                    body: Some("not from a session".into()),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let mut plaintext = vec![0xC0];
+        plaintext.extend(content.encode_to_vec());
+        plaintext.push(0x80);
+        let plaintext =
+            PlaintextContent::try_from(plaintext.as_slice()).unwrap();
+        let usmc = UnidentifiedSenderMessageContent::new(
+            CiphertextMessageType::Plaintext,
+            certificate,
+            plaintext.serialized().to_vec(),
+            ContentHint::Default,
+            None,
+        )
+        .unwrap();
+        let sealed = sealed_sender_encrypt_from_usmc(
+            &recipient,
+            &usmc,
+            &sender_store,
+            &mut rng,
+        )
+        .await
+        .unwrap();
+
+        let (_, was_plaintext) = sealed_sender_decrypt(
+            &sealed,
+            &[trust_root.public_key],
+            Timestamp::from_epoch_millis(1),
+            None,
+            recipient.clone(),
+            &mut recipient_store.clone(),
+            &mut recipient_store.clone(),
+            &mut recipient_store.clone(),
+            &mut recipient_store.clone(),
+            &mut recipient_store.clone(),
+            &mut recipient_store,
+        )
+        .await
+        .unwrap();
+        assert!(was_plaintext);
+    }
 }
