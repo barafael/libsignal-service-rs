@@ -46,6 +46,9 @@ pub struct ProvisioningSecrets {
     pub ephemeral_backup_key: Option<[u8; 32]>,
     pub account_entropy_pool: AccountEntropyPool,
     pub media_root_backup_key: Option<[u8; 32]>,
+    /// The account's read-receipt setting, which the new device starts with (`readReceipts`
+    /// in Provisioning.proto); `None` leaves it off until the setting reaches the device.
+    pub read_receipts: Option<bool>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -197,8 +200,10 @@ pub async fn link_device<
         )
         .await?;
 
-    let registration_id = csprng.random_range(1..256);
-    let pni_registration_id = csprng.random_range(1..256);
+    // As every registration does: from 1..256 alone, a device linked again would get the
+    // same ID too often for others to notice that it changed.
+    let registration_id = generate_registration_id(csprng);
+    let pni_registration_id = generate_registration_id(csprng);
 
     let provisioning_pipe = ProvisioningPipe::from_socket(ws, csprng);
     let provision_stream = provisioning_pipe.stream();
