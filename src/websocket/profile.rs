@@ -157,10 +157,9 @@ impl SignalWebSocket<websocket::Identified> {
             .await?
             .json()
             .await?;
-        let response =
-            profile.credential.ok_or(ServiceError::InvalidFrame {
-                reason: "no profile key credential in the profile",
-            })?;
+        let response = profile
+            .credential
+            .ok_or(ServiceError::MissingProfileKeyCredential)?;
         let response: zkgroup::profiles::ExpiringProfileKeyCredentialResponse =
             zkgroup::deserialize(&response)?;
         let now = std::time::SystemTime::now()
