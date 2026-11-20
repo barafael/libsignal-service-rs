@@ -33,6 +33,7 @@ TOPICS=(
     pr/signed-group-change      # #496
     pr/group-logs               # #497
     pr/sender-key-send          # no pull request yet: a group message in one request
+    pr/story-list-send          # no pull request yet, on pr/sender-key-send: a story to a list
     fix/sealed-plaintext        # no pull request
 )
 
