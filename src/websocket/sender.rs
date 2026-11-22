@@ -27,7 +27,6 @@ error_mapper! {
 // Signal-Server: controllers/MessageController.java:466
 // (PUT /v1/messages/multi_recipient)
 error_mapper! {
-    #[allow(dead_code)]
     put_multi_recipient_messages_errors:
         // 409: mismatched devices, MessageController.java:670
         CONFLICT => MultiRecipientMismatchedDevices(Vec<crate::push_service::AccountMismatchedDevices>),
@@ -64,4 +63,40 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             .json(&messages)?;
         self.request_json_with(request, put_messages_errors).await
     }
+
+    /// One message sealed for many devices
+    /// (`sealed_sender_multi_recipient_encrypt`): `PUT
+    /// /v1/messages/multi_recipient`. `access_key` is the recipients' access
+    /// keys combined (XOR); a story goes without one.
+    pub async fn send_multi_recipient(
+        &mut self,
+        body: Vec<u8>,
+        access_key: Option<[u8; 16]>,
+        timestamp: u64,
+        online: bool,
+        urgent: bool,
+        story: bool,
+    ) -> Result<MultiRecipientResponse, ServiceError> {
+        let mut request = WebSocketRequestMessage::new(Method::PUT)
+            .path(format!(
+                "/v1/messages/multi_recipient?ts={timestamp}&online={online}&urgent={urgent}&story={story}"
+            ))
+            .header("content-type", "application/vnd.signal-messenger.mrm");
+        if let Some(key) = access_key {
+            request = request
+                .header("Unidentified-Access-Key", BASE64_RELAXED.encode(key));
+        }
+        let mut request = request.build();
+        request.body = Some(body);
+        self.request_json_with(request, put_multi_recipient_messages_errors)
+            .await
+    }
+}
+
+/// What the server answers a multi-recipient send: the recipients it doesn't
+/// know.
+#[derive(Debug, serde::Deserialize)]
+pub struct MultiRecipientResponse {
+    #[serde(default)]
+    pub uuids404: Vec<String>,
 }
