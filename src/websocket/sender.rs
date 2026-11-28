@@ -8,7 +8,8 @@ use libsignal_net_grpc::proto::chat::messages::{
     send_sealed_sender_message_request, ChallengeRequired,
     IndividualRecipientMessageBundle, MismatchedDevices,
     SendAuthenticatedSenderMessageRequest, SendMessageType,
-    SendSealedSenderMessageRequest, SendSyncMessageRequest,
+    SendSealedSenderMessageRequest, SendStoryMessageRequest,
+    SendSyncMessageRequest,
 };
 
 use crate::{
@@ -27,12 +28,13 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         &mut self,
         messages: OutgoingPushMessages,
     ) -> Result<SendMessageResponse, ServiceError> {
+        let urgent = messages.urgent;
         let (destination, ephemeral, messages) = messages.into_parts()?;
         let response = MessagesClient::new(self.grpc.authenticated()?)
             .send_message(SendAuthenticatedSenderMessageRequest {
                 destination: Some(destination.into()),
                 ephemeral,
-                urgent: true,
+                urgent,
                 messages: Some(messages),
             })
             .await?
@@ -45,10 +47,11 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         &mut self,
         messages: OutgoingPushMessages,
     ) -> Result<SendMessageResponse, ServiceError> {
+        let urgent = messages.urgent;
         let (_destination, _ephemeral, messages) = messages.into_parts()?;
         let response = MessagesClient::new(self.grpc.authenticated()?)
             .send_sync_message(SendSyncMessageRequest {
-                urgent: true,
+                urgent,
                 messages: Some(messages),
             })
             .await?
@@ -63,24 +66,35 @@ impl<C: WebSocketType> SignalWebSocket<C> {
     ) -> Result<SendMessageResponse, ServiceError> {
         use send_message_response::Response;
 
+        let story = messages.story;
+        let urgent = messages.urgent;
         let (destination, ephemeral, messages) = messages.into_parts()?;
-        let response =
-            MessagesAnonymousClient::new(self.grpc.unauthenticated())
-                .send_single_recipient_message(
-                    SendSealedSenderMessageRequest {
-                        destination: Some(destination.into()),
-                        ephemeral,
-                        urgent: true,
-                        messages: Some(messages),
-                        authorization: Some(
-                            send_sealed_sender_message_request::Authorization::UnidentifiedAccessKey(
-                                access.key.clone(),
-                            ),
-                        ),
-                    },
-                )
+        let mut client =
+            MessagesAnonymousClient::new(self.grpc.unauthenticated());
+        let response = if story {
+            client
+                .send_story(SendStoryMessageRequest {
+                    destination: Some(destination.into()),
+                    urgent,
+                    messages: Some(messages),
+                })
                 .await?
-                .into_inner();
+        } else {
+            client
+                .send_single_recipient_message(SendSealedSenderMessageRequest {
+                    destination: Some(destination.into()),
+                    ephemeral,
+                    urgent,
+                    messages: Some(messages),
+                    authorization: Some(
+                        send_sealed_sender_message_request::Authorization::UnidentifiedAccessKey(
+                            access.key.clone(),
+                        ),
+                    ),
+                })
+                .await?
+        }
+        .into_inner();
         match response.response {
             Some(Response::Success(())) => {
                 Ok(SendMessageResponse { needs_sync: false })
@@ -178,6 +192,8 @@ impl OutgoingPushMessages {
             timestamp,
             messages,
             online,
+            urgent: _,
+            story: _,
         } = self;
         let messages = messages
             .into_iter()
