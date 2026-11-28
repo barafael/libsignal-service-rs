@@ -5,7 +5,9 @@ use crate::{
     configuration::{Endpoint, ServiceCredentials, SignalServers},
     grpc::GrpcChannels,
     prelude::ServiceConfiguration,
-    websocket::{SignalWebSocket, WebSocketType},
+    websocket::{
+        SignalWebSocket, WebSocketError, WebSocketOperation, WebSocketType,
+    },
 };
 
 use libsignal_core::DeviceId;
@@ -22,6 +24,7 @@ pub static DEFAULT_DEVICE_ID: LazyLock<libsignal_core::DeviceId> =
 
 mod account;
 mod cdn;
+pub use cdn::CdnError;
 mod error;
 pub mod linking;
 pub(crate) mod response;
@@ -163,13 +166,29 @@ impl PushService {
                 .basic_auth(credentials.login(), credentials.password.clone());
         }
 
-        let ws = builder
-            .upgrade()
-            .send()
-            .await?
-            .into_websocket()
-            .instrument(span.clone())
-            .await?;
+        let (ws, alerts) = async {
+            let response = builder.upgrade().send().await?;
+            // What the server warns of on connecting, e.g. `idle-primary-device`: the account's
+            // primary hasn't been seen for a while, and linked devices may be removed.
+            let alerts: Vec<String> = response
+                .headers()
+                .get_all("X-Signal-Alert")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|value| value.split(','))
+                .map(|alert| alert.trim().to_owned())
+                .filter(|alert| !alert.is_empty())
+                .collect();
+            Ok::<_, reqwest_websocket::Error>((
+                response.into_websocket().await?,
+                alerts,
+            ))
+        }
+        .instrument(span.clone())
+        .await
+        .map_err(|error| {
+            WebSocketError::new(WebSocketOperation::Connect, error)
+        })?;
 
         let grpc = GrpcChannels::new(
             &self.cfg,
@@ -190,7 +209,8 @@ impl PushService {
             unidentified_push_service,
         );
         let task = task.instrument(span);
-        tokio::task::spawn(task);
+        ws.set_task(tokio::task::spawn(task));
+        ws.inner_locked().alerts = alerts;
         Ok(ws)
     }
 
