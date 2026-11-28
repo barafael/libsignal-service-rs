@@ -890,6 +890,10 @@ where
     /// says so: the caller distributes the key to the new devices and sends
     /// again. A recipient the server doesn't know comes back as
     /// [`MessageSenderError::NotFound`], the others as sent.
+    ///
+    /// `group_id` is the group's, sealed with the message so a device that
+    /// can't decrypt it knows where to ask again; `None` for a story to a
+    /// story list (My Story), which Signal's apps send without one.
     #[expect(clippy::too_many_arguments)]
     #[tracing::instrument(
         skip(self, recipients, content_body),
@@ -898,7 +902,7 @@ where
     pub async fn send_with_sender_key(
         &mut self,
         distribution_id: Uuid,
-        group_id: &[u8],
+        group_id: Option<&[u8]>,
         recipients: &[(ServiceId, UnidentifiedAccess)],
         content_body: &ContentBody,
         timestamp: u64,
@@ -954,7 +958,7 @@ where
             certificate,
             message.serialized().to_vec(),
             ContentHint::Resendable,
-            Some(group_id.to_vec()),
+            group_id.map(<[u8]>::to_vec),
         )?;
         let address_refs: Vec<&ProtocolAddress> = addresses.iter().collect();
         let session_refs: Vec<&SessionRecord> = sessions.iter().collect();
