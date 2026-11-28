@@ -52,6 +52,10 @@ pub struct OutgoingPushMessages {
     pub timestamp: u64,
     pub messages: Vec<OutgoingPushMessage>,
     pub online: bool,
+    /// A story, sent as one (`MessagesAnonymous/SendStory`): the server
+    /// stores it without its sender, and only devices that take stories get it.
+    #[serde(skip)]
+    pub story: bool,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -147,6 +151,9 @@ pub enum MessageSenderError {
 
     #[error("no messages were encrypted: this should not really happen and most likely implies a logic error")]
     NoMessagesToSend,
+
+    #[error("a story to {service_id:?} needs sealed sender: the server stores stories without their sender")]
+    StoryWithoutSealedSender { service_id: ServiceId },
 }
 
 pub type GroupV2Id = [u8; GROUP_IDENTIFIER_LEN];
@@ -618,6 +625,16 @@ where
 
         let content_bytes = content.encode_to_vec();
 
+        // The server stores a story without its sender (Signal-Server
+        // MessageController.java, `sendStoryMessage`): sent identified, it
+        // couldn't be decrypted.
+        let story = matches!(content_body, ContentBody::StoryMessage(_));
+        if story && unidentified_access.is_none() {
+            return Err(MessageSenderError::StoryWithoutSealedSender {
+                service_id: recipient,
+            });
+        }
+
         let mut rng = rng();
 
         for _ in 0..4u8 {
@@ -647,6 +664,7 @@ where
                 timestamp,
                 messages,
                 online,
+                story,
             };
 
             let send = if recipient == self.local_aci {
@@ -673,8 +691,10 @@ where
                         needs_sync,
                     });
                 },
+                // The server checks no access key for a story: a story is
+                // never sent identified.
                 Err(ServiceError::Unauthorized)
-                    if unidentified_access.is_some() =>
+                    if unidentified_access.is_some() && !story =>
                 {
                     tracing::trace!("unauthorized error using unidentified; retry over identified");
                     unidentified_access = None;
