@@ -1,5 +1,5 @@
 use aes::cipher::block_padding;
-use libsignal_core::curve::CurveError;
+use libsignal_core::{curve::CurveError, ServiceId};
 use libsignal_protocol::{
     FingerprintError, ProtocolAddress, ServiceIdKind, SignalProtocolError,
 };
@@ -21,6 +21,18 @@ use crate::{
 };
 
 use super::{MismatchedDevices, ProofRequired, StaleDevices};
+
+#[derive(Debug)]
+pub struct AccountMismatchedDevices {
+    pub uuid: ServiceId,
+    pub devices: MismatchedDevices,
+}
+
+#[derive(Debug)]
+pub struct AccountStaleDevices {
+    pub uuid: ServiceId,
+    pub devices: StaleDevices,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,6 +135,12 @@ pub enum ServiceError {
 
     #[error("{0:?}")]
     StaleDevices(StaleDevices),
+
+    #[error("multi-recipient mismatched devices: {0:?}")]
+    MultiRecipientMismatchedDevices(Vec<AccountMismatchedDevices>),
+
+    #[error("multi-recipient stale devices: {0:?}")]
+    MultiRecipientStaleDevices(Vec<AccountStaleDevices>),
 
     #[error(transparent)]
     CredentialsCacheError(#[from] crate::groups_v2::CredentialsCacheError),
