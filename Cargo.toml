@@ -60,6 +60,9 @@ tonic = { version = "0.14", default-features = false, features = [
   "transport",
   "tls-ring",
 ] }
+# The websocket errors reqwest-websocket wraps, so that `WebSocketError` can name them. Same
+# version as reqwest-websocket's, or the types won't match.
+tungstenite = { version = "0.28", default-features = false }
 
 tracing = { version = "0.1", features = ["log"] }
 tracing-futures = "0.2"
