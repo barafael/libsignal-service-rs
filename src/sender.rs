@@ -52,6 +52,12 @@ pub struct OutgoingPushMessages {
     pub timestamp: u64,
     pub messages: Vec<OutgoingPushMessage>,
     pub online: bool,
+    /// Whether offline devices are woken for it ([`ContentBody::urgent`]).
+    pub urgent: bool,
+    /// A story, sent as one (`MessagesAnonymous/SendStory`): the server
+    /// stores it without its sender, and only devices that take stories get it.
+    #[serde(skip)]
+    pub story: bool,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -147,6 +153,9 @@ pub enum MessageSenderError {
 
     #[error("no messages were encrypted: this should not really happen and most likely implies a logic error")]
     NoMessagesToSend,
+
+    #[error("a story to {service_id:?} needs sealed sender: the server stores stories without their sender")]
+    StoryWithoutSealedSender { service_id: ServiceId },
 }
 
 pub type GroupV2Id = [u8; GROUP_IDENTIFIER_LEN];
@@ -622,6 +631,16 @@ where
 
         let content_bytes = content.encode_to_vec();
 
+        // The server stores a story without its sender (Signal-Server
+        // MessageController.java, `sendStoryMessage`): sent identified, it
+        // couldn't be decrypted.
+        let story = matches!(content_body, ContentBody::StoryMessage(_));
+        if story && unidentified_access.is_none() {
+            return Err(MessageSenderError::StoryWithoutSealedSender {
+                service_id: recipient,
+            });
+        }
+
         let mut rng = rng();
         let session_lock = self.cipher.session_lock().clone();
 
@@ -652,6 +671,8 @@ where
                 timestamp,
                 messages,
                 online,
+                urgent: content_body.urgent(),
+                story,
             };
 
             let send = if recipient == self.local_aci {
@@ -678,8 +699,10 @@ where
                         needs_sync,
                     });
                 },
+                // The server checks no access key for a story: a story is
+                // never sent identified.
                 Err(ServiceError::Unauthorized)
-                    if unidentified_access.is_some() =>
+                    if unidentified_access.is_some() && !story =>
                 {
                     tracing::trace!("unauthorized error using unidentified; retry over identified");
                     unidentified_access = None;
@@ -1199,4 +1222,63 @@ where
             ..SyncMessage::with_padding(&mut rng())
         }))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_what_a_person_should_see_now_is_urgent() {
+        use crate::content::ContentBody;
+        use crate::proto::{
+            data_message::Flags, sync_message, DataMessage, ReceiptMessage,
+            SyncMessage, TypingMessage,
+        };
+
+        let text = DataMessage {
+            body: Some("hello".into()),
+            ..Default::default()
+        };
+        let timer = DataMessage {
+            flags: Some(Flags::ExpirationTimerUpdate as u32),
+            ..Default::default()
+        };
+        let read = SyncMessage {
+            read: vec![sync_message::Read::default()],
+            ..Default::default()
+        };
+        let keys = SyncMessage {
+            content: Some(sync_message::Content::Request(
+                sync_message::Request {
+                    r#type: Some(sync_message::request::Type::Keys as i32),
+                },
+            )),
+            ..Default::default()
+        };
+        let blocked = SyncMessage {
+            content: Some(sync_message::Content::Request(
+                sync_message::Request {
+                    r#type: Some(sync_message::request::Type::Blocked as i32),
+                },
+            )),
+            ..Default::default()
+        };
+        let sent = SyncMessage {
+            content: Some(sync_message::Content::Sent(
+                sync_message::Sent::default(),
+            )),
+            ..Default::default()
+        };
+
+        assert!(ContentBody::DataMessage(text).urgent());
+        assert!(!ContentBody::DataMessage(timer).urgent());
+        assert!(
+            !ContentBody::ReceiptMessage(ReceiptMessage::default()).urgent()
+        );
+        assert!(!ContentBody::TypingMessage(TypingMessage::default()).urgent());
+        assert!(ContentBody::SynchronizeMessage(read).urgent());
+        assert!(ContentBody::SynchronizeMessage(keys).urgent());
+        assert!(!ContentBody::SynchronizeMessage(blocked).urgent());
+        assert!(!ContentBody::SynchronizeMessage(sent).urgent());
+    }
+
 }
