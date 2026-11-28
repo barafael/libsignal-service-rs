@@ -28,12 +28,13 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         &mut self,
         messages: OutgoingPushMessages,
     ) -> Result<SendMessageResponse, ServiceError> {
+        let urgent = messages.urgent;
         let (destination, ephemeral, messages) = messages.into_parts()?;
         let response = MessagesClient::new(self.grpc.authenticated()?)
             .send_message(SendAuthenticatedSenderMessageRequest {
                 destination: Some(destination.into()),
                 ephemeral,
-                urgent: true,
+                urgent,
                 messages: Some(messages),
             })
             .await?
@@ -46,10 +47,11 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         &mut self,
         messages: OutgoingPushMessages,
     ) -> Result<SendMessageResponse, ServiceError> {
+        let urgent = messages.urgent;
         let (_destination, _ephemeral, messages) = messages.into_parts()?;
         let response = MessagesClient::new(self.grpc.authenticated()?)
             .send_sync_message(SendSyncMessageRequest {
-                urgent: true,
+                urgent,
                 messages: Some(messages),
             })
             .await?
@@ -65,6 +67,7 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         use send_message_response::Response;
 
         let story = messages.story;
+        let urgent = messages.urgent;
         let (destination, ephemeral, messages) = messages.into_parts()?;
         let mut client =
             MessagesAnonymousClient::new(self.grpc.unauthenticated());
@@ -72,7 +75,7 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             client
                 .send_story(SendStoryMessageRequest {
                     destination: Some(destination.into()),
-                    urgent: true,
+                    urgent,
                     messages: Some(messages),
                 })
                 .await?
@@ -81,7 +84,7 @@ impl<C: WebSocketType> SignalWebSocket<C> {
                 .send_single_recipient_message(SendSealedSenderMessageRequest {
                     destination: Some(destination.into()),
                     ephemeral,
-                    urgent: true,
+                    urgent,
                     messages: Some(messages),
                     authorization: Some(
                         send_sealed_sender_message_request::Authorization::UnidentifiedAccessKey(
@@ -189,6 +192,7 @@ impl OutgoingPushMessages {
             timestamp,
             messages,
             online,
+            urgent: _,
             story: _,
         } = self;
         let messages = messages
